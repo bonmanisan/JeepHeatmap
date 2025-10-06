@@ -1,5 +1,5 @@
 # ============================================================
-# 🚕 Jeepney Volume Prediction Model Trainer (FINAL FIXED)
+# 🚕 Jeepney Volume Prediction Model Trainer (SHOW WORDS VERSION)
 # ============================================================
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -101,8 +101,26 @@ print(f"📊 R² Score: {r2:.3f}")
 print(f"📉 MAE: {mae:.3f}")
 
 # ============================================================
-# 7️⃣ Save model
+# 7️⃣ Show sample predictions (with words)
+# ============================================================
+print("\n🔍 Sample Predictions (showing categorical words):\n")
+sample_count = min(10, len(X_test))
+sample_df = X_test.head(sample_count).copy()
+sample_df["Actual Volume"] = y_test.head(sample_count).values
+sample_df["Predicted Volume"] = y_pred[:sample_count].round(2)
+
+for i, row in sample_df.iterrows():
+    stop = row["stop"]
+    day = row["dayofweek"]
+    season = row["season"]
+    event = row["event"]
+    actual = row["Actual Volume"]
+    predicted = row["Predicted Volume"]
+    print(f"🚌 Stop = {stop} | Day = {day} | Season = {season} | Event = {event} → Predicted = {predicted}, Actual = {actual}")
+
+# ============================================================
+# 8️⃣ Save model
 # ============================================================
 artifact = {"model": pipeline, "feature_cols": expected_features}
 joblib.dump(artifact, "jeep_pipeline.joblib")
-print("💾 Saved model to jeep_pipeline.joblib")
+print("\n💾 Saved model to jeep_pipeline.joblib")

@@ -5,14 +5,12 @@ import folium
 from folium.plugins import HeatMap
 from branca.colormap import linear
 import os
+from datetime import datetime
 
-# ============================================================
-# 1️⃣ Initialize Flask
-# ============================================================
 app = Flask(__name__)
 
 # ============================================================
-# 2️⃣ Load model and dataset
+# 1️⃣ Load model and dataset
 # ============================================================
 MODEL_FILE = "jeep_pipeline.joblib"
 DATA_FILE = "expandedDataset_with_JeepVolume.csv"
@@ -22,42 +20,54 @@ if not os.path.exists(MODEL_FILE):
 if not os.path.exists(DATA_FILE):
     raise FileNotFoundError("❌ expandedDataset_with_JeepVolume.csv not found — please include your dataset.")
 
-# Load model + metadata
 artifact = joblib.load(MODEL_FILE)
 rf_model = artifact["model"]
 feature_cols = artifact["feature_cols"]
 
-# Load dataset
 df = pd.read_csv(DATA_FILE)
-df.columns = [c.lower() for c in df.columns]
+df.columns = [c.lower().strip() for c in df.columns]
 
 # Detect columns
 lat_col = next((c for c in df.columns if "lat" in c), None)
 lon_col = next((c for c in df.columns if "lon" in c), None)
-vol_col = next((c for c in df.columns if "volume" in c or "count" in c), None)
 
 if lat_col is None or lon_col is None:
     raise ValueError("Dataset must include latitude and longitude columns.")
-
-# If no volume column, create one by counting points
-if vol_col is None:
-    df["volume"] = df.groupby([lat_col, lon_col])[lat_col].transform("count")
-else:
-    df = df.rename(columns={vol_col: "volume"})
 
 df = df.rename(columns={lat_col: "latitude", lon_col: "longitude"})
 
 print(f"✅ Loaded dataset: {len(df)} rows")
 
 # ============================================================
-# 3️⃣ Routes
+# 2️⃣ Helper — auto detect current time & event from CSV
 # ============================================================
+def auto_fill_from_csv():
+    now = datetime.now()
+    current_day = now.strftime("%A")
+    current_hour = now.hour
+    month = now.month
+    season = "Dry" if month in [12, 1, 2, 3, 4, 5] else "Wet"
 
-@app.route("/")
-def index():
-    return render_template("map.html")
+    # Look up event from CSV for this day/hour
+    event = "None"
+    if "event" in df.columns:
+        match = df[
+            (df["dayofweek"].str.lower() == current_day.lower()) &
+            (df["hour"] == current_hour)
+        ]
+        if not match.empty:
+            event = match["event"].iloc[0]
 
+    return {
+        "dayofweek": current_day,
+        "hour": current_hour,
+        "season": season,
+        "event": event
+    }
 
+# ============================================================
+# 3️⃣ Predict API
+# ============================================================
 @app.route("/api/predict", methods=["GET"])
 def predict():
     try:
@@ -67,80 +77,78 @@ def predict():
         return jsonify({"error": "Provide valid ?lat= and ?lon= query parameters"}), 400
 
     stop = request.args.get("stop", "")
-    dayofweek = request.args.get("dayofweek", "")
-    hour = request.args.get("hour", "")
-    season = request.args.get("season", "")
-    event = request.args.get("event", "")
-    jeepvolume = request.args.get("jeepvolume", "")
+    auto_data = auto_fill_from_csv()
 
     input_dict = {
         "latitude": lat,
         "longitude": lon,
         "stop": stop,
-        "dayofweek": dayofweek,
-        "hour": hour,
-        "season": season,
-        "event": event,
-        "jeepvolume": jeepvolume
+        "dayofweek": auto_data["dayofweek"],
+        "hour": auto_data["hour"],
+        "season": auto_data["season"],
+        "event": auto_data["event"],
+        "jeepvolume": 0
     }
 
     feat_df = pd.DataFrame([input_dict], columns=feature_cols)
     pred = float(rf_model.predict(feat_df)[0])
 
     return jsonify({
-        "latitude": lat,
-        "longitude": lon,
-        "stop": stop,
-        "dayofweek": dayofweek,
-        "hour": hour,
-        "season": season,
-        "event": event,
-        "jeepvolume": jeepvolume,
+        **input_dict,
         "predicted_volume": round(pred, 2)
     })
 
-
-@app.route("/api/map")
-def map_data():
-    """Return heatmap data as JSON for mobile or web app."""
-    data = df[["latitude", "longitude", "volume"]].to_dict(orient="records")
-    return jsonify(data)
-
-
+# ============================================================
+# 4️⃣ Dynamic Heatmap
+# ============================================================
 @app.route("/map")
 def show_map():
-    """Render Folium map with heatmap overlay based on jeep volume."""
+    auto_data = auto_fill_from_csv()
+    print(f"🌤 Using {auto_data}")
+
+    # Prepare input for all stops in the dataset
+    input_data = []
+    for _, row in df.iterrows():
+        input_data.append({
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+            "stop": row.get("stop", ""),
+            "dayofweek": auto_data["dayofweek"],
+            "hour": auto_data["hour"],
+            "season": auto_data["season"],
+            "event": auto_data["event"],
+            "jeepvolume": 0
+        })
+
+    pred_df = pd.DataFrame(input_data, columns=feature_cols)
+    df["predicted_volume"] = rf_model.predict(pred_df)
+
+    # Normalize for heat intensity
+    min_vol = df["predicted_volume"].min()
+    max_vol = df["predicted_volume"].max()
+    df["volume_norm"] = (df["predicted_volume"] - min_vol) / (max_vol - min_vol)
+
     center = [df["latitude"].mean(), df["longitude"].mean()]
     m = folium.Map(location=center, zoom_start=13)
 
-    # Normalize volume for weight
-    min_vol = df["volume"].min()
-    max_vol = df["volume"].max()
-    df["volume_norm"] = (df["volume"] - min_vol) / (max_vol - min_vol)
-
-    # Prepare heatmap data: [lat, lon, normalized_volume]
     heat_data = df[["latitude", "longitude", "volume_norm"]].values.tolist()
-
-    # Add HeatMap: colors reflect jeepvolume
     HeatMap(
         heat_data,
         radius=12,
         blur=15,
         max_zoom=13,
-        gradient={0.0: 'green', 0.5: 'yellow', 1.0: 'red'}  # low → green, medium → yellow, high → red
+        gradient={0.0: "green", 0.5: "yellow", 1.0: "red"}
     ).add_to(m)
 
-    # Add legend for actual jeep volume
+    # Color legend
     colormap = linear.YlOrRd_09.scale(min_vol, max_vol)
-    colormap.caption = "Jeep Volume"
+    colormap.caption = f"Predicted Jeep Volume ({auto_data['dayofweek']} {auto_data['hour']}:00, {auto_data['season']}, {auto_data['event']})"
     colormap.add_to(m)
 
-    map_html = m._repr_html_()
-    return render_template("map.html", map_html=map_html)
-
+    return render_template("map.html", map_html=m._repr_html_())
 
 # ============================================================
-# 4️⃣ Run app
+# 5️⃣ Run app
 # ============================================================
 if __name__ == "__main__":
     print("🚀 Flask app running at http://127.0.0.1:5000")
